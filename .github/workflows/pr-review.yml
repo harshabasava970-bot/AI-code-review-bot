@@ -1,0 +1,37 @@
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    name: AI PR Review (Groq)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run AI PR Reviewer
+        env:
+          GROQ_API_KEY:  ${{ secrets.GROQ_API_KEY }}
+          GITHUB_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER:     ${{ github.event.pull_request.number }}
+          GROQ_MODEL:    "llama-3.3-70b-versatile"
+          MAX_FILES:     "10"
+          MAX_PATCH_CHARS: "3000"
+        run: python reviewer.py
