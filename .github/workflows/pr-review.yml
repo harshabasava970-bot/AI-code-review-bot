@@ -12,7 +12,6 @@ jobs:
   ai-review:
     runs-on: ubuntu-latest
     name: AI PR Review (Groq)
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,15 +22,15 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install httpx
 
       - name: Run AI PR Reviewer
         env:
-          GROQ_API_KEY:  ${{ secrets.GROQ_API_KEY }}
-          GITHUB_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          PR_NUMBER:     ${{ github.event.pull_request.number }}
-          GROQ_MODEL:    "llama-3.3-70b-versatile"
-          MAX_FILES:     "10"
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GROQ_MODEL: "llama-3.3-70b-versatile"
+          MAX_FILES: "10"
           MAX_PATCH_CHARS: "3000"
         run: python reviewer.py
