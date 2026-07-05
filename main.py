@@ -1,0 +1,342 @@
+"""
+main.py - FastAPI webhook server for AI PR Code Reviewer
+Receives GitHub webhook events and auto-reviews PRs using Groq (free)
+"""
+import os
+import json
+import hmac
+import hashlib
+import asyncio
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi.responses import HTMLResponse
+import httpx
+
+app = FastAPI(
+    title="AI Code Review Bot",
+    description="Auto-reviews GitHub PRs using Groq LLM - 100% free",
+    version="1.0.0"
+)
+
+GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
+GITHUB_TOKEN    = os.environ.get("GITHUB_TOKEN", "")
+WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET", "")
+GROQ_MODEL      = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+MAX_FILES       = int(os.environ.get("MAX_FILES", "10"))
+MAX_PATCH_CHARS = int(os.environ.get("MAX_PATCH_CHARS", "3000"))
+
+
+def verify_signature(payload: bytes, signature: str) -> bool:
+    if not WEBHOOK_SECRET:
+        return True  # Skip verification if no secret set
+    expected = "sha256=" + hmac.new(
+        WEBHOOK_SECRET.encode(), payload, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+async def groq_chat(messages: list, temperature: float = 0.3) -> str:
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": 2048,
+            }
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+
+async def get_pr_files(repo: str, pr_number: int) -> list:
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(
+            f"https://api.github.com/repos/{repo}/pulls/{pr_number}/files",
+            headers={
+                "Authorization": f"Bearer {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github+json",
+            }
+        )
+        resp.raise_for_status()
+        return resp.json()[:MAX_FILES]
+
+
+async def get_pr_info(repo: str, pr_number: int) -> dict:
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(
+            f"https://api.github.com/repos/{repo}/pulls/{pr_number}",
+            headers={
+                "Authorization": f"Bearer {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github+json",
+            }
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def post_pr_comment(repo: str, pr_number: int, body: str):
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments",
+            headers={
+                "Authorization": f"Bearer {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github+json",
+            },
+            json={"body": body}
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def review_file(filename: str, patch: str) -> list:
+    if not patch:
+        return []
+    patch = patch[:MAX_PATCH_CHARS]
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an expert code reviewer. Review the git diff and find bugs, "
+                "security issues, performance problems, or bad practices. "
+                "Be concise. Format as JSON array: [{"issue": "description", "severity": "high|medium|low"}]. "
+                "Return [] if code looks good."
+            )
+        },
+        {"role": "user", "content": f"Review diff for {filename}:\n```diff\n{patch}\n```"}
+    ]
+    try:
+        resp = await groq_chat(messages, temperature=0.2)
+        start, end = resp.find("["), resp.rfind("]") + 1
+        if start == -1 or end == 0:
+            return []
+        return json.loads(resp[start:end])
+    except Exception:
+        return []
+
+
+async def generate_summary(pr_info: dict, files: list) -> str:
+    changed = "\n".join([
+        f"- {f['filename']} (+{f.get('additions',0)} -{f.get('deletions',0)})"
+        for f in files
+    ])
+    diffs = "\n\n".join([
+        f"File: {f['filename']}\n```diff\n{f.get('patch','')[:1500]}\n```"
+        for f in files[:4]
+    ])
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an expert code reviewer. Give a concise PR review with: "
+                "1) What this PR does, 2) Key issues found, 3) Overall verdict. "
+                "Use markdown. Be direct and helpful."
+            )
+        },
+        {
+            "role": "user",
+            "content": (
+                f"PR: {pr_info.get('title','')}\n"
+                f"Description: {(pr_info.get('body','') or '')[:300]}\n\n"
+                f"Files changed:\n{changed}\n\nDiffs:\n{diffs}"
+            )
+        }
+    ]
+    try:
+        return await groq_chat(messages, temperature=0.3)
+    except Exception as e:
+        return f"Could not generate summary: {e}"
+
+
+async def process_pr(repo: str, pr_number: int, pr_title: str):
+    """Background task: review the PR and post comment."""
+    print(f"Reviewing PR #{pr_number} in {repo}: {pr_title}")
+    try:
+        pr_info = await get_pr_info(repo, pr_number)
+        files   = await get_pr_files(repo, pr_number)
+        print(f"  Found {len(files)} files")
+
+        # Review each file
+        all_issues = []
+        file_reviews = []
+        for f in files:
+            fname = f.get("filename", "")
+            issues = await review_file(fname, f.get("patch", ""))
+            if issues:
+                all_issues.extend(issues)
+                lines = [f"**`{fname}`**"]
+                for issue in issues:
+                    sev = issue.get("severity", "medium")
+                    emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(sev, "🟡")
+                    lines.append(f"  {emoji} {issue.get('issue', str(issue))}")
+                file_reviews.append("\n".join(lines))
+
+        # Generate summary
+        summary = await generate_summary(pr_info, files)
+
+        # Build comment
+        issues_section = ""
+        if file_reviews:
+            issues_section = "\n\n### Inline Issues Found\n\n" + "\n\n".join(file_reviews)
+        else:
+            issues_section = "\n\n### Inline Issues\n\n✅ No major issues found in the changed files."
+
+        comment = (
+            "## 🤖 AI Code Review\n\n"
+            f"*Powered by **Groq** ({GROQ_MODEL}) — Free AI PR Reviewer*\n\n"
+            "---\n\n"
+            f"{summary}"
+            f"{issues_section}\n\n"
+            "---\n"
+            f"*Reviewed **{len(files)}** file(s) · Found **{len(all_issues)}** issue(s)*"
+        )
+
+        await post_pr_comment(repo, pr_number, comment)
+        print(f"  Review posted for PR #{pr_number}")
+
+    except Exception as e:
+        print(f"  Error reviewing PR #{pr_number}: {e}")
+        try:
+            await post_pr_comment(repo, pr_number,
+                f"## 🤖 AI Code Review\n\n❌ Review failed: {e}")
+        except Exception:
+            pass
+
+
+# ── ROUTES ────────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "model": GROQ_MODEL}
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard():
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Code Review Bot</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #0d1117; color: #e6edf3; min-height: 100vh; }
+  .container { max-width: 800px; margin: 0 auto; padding: 60px 20px; }
+  .badge { display: inline-block; background: #238636; color: #fff;
+           padding: 4px 12px; border-radius: 20px; font-size: 13px; margin-bottom: 20px; }
+  h1 { font-size: 2.5rem; font-weight: 700; margin-bottom: 12px; }
+  .subtitle { color: #8b949e; font-size: 1.1rem; margin-bottom: 40px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+          padding: 28px; margin-bottom: 24px; }
+  .card h2 { font-size: 1.1rem; margin-bottom: 16px; color: #58a6ff; }
+  .step { display: flex; gap: 16px; margin-bottom: 16px; align-items: flex-start; }
+  .step-num { background: #1f6feb; color: #fff; width: 28px; height: 28px;
+              border-radius: 50%; display: flex; align-items: center; justify-content: center;
+              font-size: 13px; font-weight: 700; flex-shrink: 0; }
+  .step-text { color: #8b949e; font-size: 14px; line-height: 1.6; }
+  .step-text code { background: #21262d; padding: 2px 8px; border-radius: 4px;
+                    font-family: monospace; color: #e6edf3; font-size: 13px; }
+  .status { display: flex; align-items: center; gap: 8px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #238636;
+         box-shadow: 0 0 8px #238636; }
+  .stack { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .tag { background: #21262d; border: 1px solid #30363d; padding: 4px 12px;
+         border-radius: 20px; font-size: 12px; color: #8b949e; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="badge">✅ Live</div>
+  <h1>🤖 AI Code Review Bot</h1>
+  <p class="subtitle">Auto-reviews GitHub PRs using Groq AI — 100% free, unlimited</p>
+
+  <div class="card">
+    <h2>⚡ Status</h2>
+    <div class="status">
+      <div class="dot"></div>
+      <span>Webhook server is running and ready to receive GitHub events</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>🔧 Setup — Connect your GitHub repo</h2>
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-text">Go to your GitHub repo → <strong>Settings</strong> → <strong>Webhooks</strong> → <strong>Add webhook</strong></div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-text">Set <strong>Payload URL</strong> to: <code>YOUR_RENDER_URL/webhook</code></div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-text">Set <strong>Content type</strong> to <code>application/json</code></div>
+    </div>
+    <div class="step">
+      <div class="step-num">4</div>
+      <div class="step-text">Select <strong>Pull requests</strong> event only</div>
+    </div>
+    <div class="step">
+      <div class="step-num">5</div>
+      <div class="step-text">Click <strong>Add webhook</strong> — done! Open a PR to test.</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>🛠 Stack</h2>
+    <div class="stack">
+      <span class="tag">FastAPI</span>
+      <span class="tag">Python 3.11</span>
+      <span class="tag">Groq llama-3.3-70b</span>
+      <span class="tag">GitHub Webhooks</span>
+      <span class="tag">Render.com (free)</span>
+    </div>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+
+@app.post("/webhook")
+async def webhook(request: Request, background_tasks: BackgroundTasks):
+    payload_bytes = await request.body()
+
+    # Verify signature
+    sig = request.headers.get("X-Hub-Signature-256", "")
+    if WEBHOOK_SECRET and not verify_signature(payload_bytes, sig):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    event = request.headers.get("X-GitHub-Event", "")
+    if event != "pull_request":
+        return {"status": "ignored", "event": event}
+
+    payload = json.loads(payload_bytes)
+    action  = payload.get("action", "")
+
+    if action not in ("opened", "synchronize", "reopened"):
+        return {"status": "ignored", "action": action}
+
+    repo      = payload["repository"]["full_name"]
+    pr_number = payload["pull_request"]["number"]
+    pr_title  = payload["pull_request"]["title"]
+
+    # Process in background so webhook returns fast
+    background_tasks.add_task(process_pr, repo, pr_number, pr_title)
+
+    return {"status": "reviewing", "pr": pr_number, "repo": repo}
+
+
+@app.post("/review")
+async def manual_review(request: Request):
+    """Manually trigger a review for any PR."""
+    body = await request.json()
+    repo      = body.get("repo")
+    pr_number = body.get("pr_number")
+    if not repo or not pr_number:
+        raise HTTPException(400, "repo and pr_number required")
+    asyncio.create_task(process_pr(repo, int(pr_number), "Manual review"))
+    return {"status": "reviewing", "pr": pr_number, "repo": repo}
