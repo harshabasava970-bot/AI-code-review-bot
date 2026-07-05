@@ -101,16 +101,13 @@ async def review_file(filename: str, patch: str) -> list:
             "content": (
                 "You are an expert code reviewer. Review the git diff and find bugs, "
                 "security issues, performance problems, or bad practices. "
-                f"Be concise. Format as JSON array: {format_hint}. "
+                "Be concise. Format as JSON array: " + format_hint + ". "
                 "Return [] if code looks good."
             )
         },
         {
             "role": "user",
-            "content": f"Review diff for {filename}:
-```diff
-{patch}
-```"
+            "content": "Review diff for " + filename + ":\n```diff\n" + patch + "\n```"
         }
     ]
     try:
@@ -125,18 +122,12 @@ async def review_file(filename: str, patch: str) -> list:
 
 
 async def generate_summary(pr_info: dict, files: list) -> str:
-    changed = "
-".join([
-        f"- {f['filename']} (+{f.get('additions', 0)} -{f.get('deletions', 0)})"
+    changed = "\n".join([
+        "- " + f["filename"] + " (+" + str(f.get("additions", 0)) + " -" + str(f.get("deletions", 0)) + ")"
         for f in files
     ])
-    diffs = "
-
-".join([
-        f"File: {f['filename']}
-```diff
-{f.get('patch', '')[:1500]}
-```"
+    diffs = "\n\n".join([
+        "File: " + f["filename"] + "\n```diff\n" + f.get("patch", "")[:1500] + "\n```"
         for f in files[:4]
     ])
     messages = [
@@ -151,32 +142,24 @@ async def generate_summary(pr_info: dict, files: list) -> str:
         {
             "role": "user",
             "content": (
-                f"PR: {pr_info.get('title', '')}
-"
-                f"Description: {(pr_info.get('body', '') or '')[:300]}
-
-"
-                f"Files changed:
-{changed}
-
-Diffs:
-{diffs}"
+                "PR: " + pr_info.get("title", "") + "\n"
+                "Description: " + (pr_info.get("body", "") or "")[:300] + "\n\n"
+                "Files changed:\n" + changed + "\n\nDiffs:\n" + diffs
             )
         }
     ]
     try:
         return await groq_chat(messages, temperature=0.3)
     except Exception as e:
-        return f"Could not generate summary: {e}"
+        return "Could not generate summary: " + str(e)
 
 
 async def process_pr(repo: str, pr_number: int, pr_title: str):
-    """Background task: review the PR and post comment."""
-    print(f"Reviewing PR #{pr_number} in {repo}: {pr_title}")
+    print("Reviewing PR #" + str(pr_number) + " in " + repo + ": " + pr_title)
     try:
         pr_info = await get_pr_info(repo, pr_number)
         files   = await get_pr_files(repo, pr_number)
-        print(f"  Found {len(files)} files")
+        print("  Found " + str(len(files)) + " files")
 
         all_issues   = []
         file_reviews = []
@@ -185,61 +168,39 @@ async def process_pr(repo: str, pr_number: int, pr_title: str):
             issues = await review_file(fname, f.get("patch", ""))
             if issues:
                 all_issues.extend(issues)
-                lines = [f"**`{fname}`**"]
+                lines = ["**`" + fname + "`**"]
                 for issue in issues:
                     sev   = issue.get("severity", "medium")
-                    emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(sev, "🟡")
-                    lines.append(f"  {emoji} {issue.get('issue', str(issue))}")
-                file_reviews.append("
-".join(lines))
+                    emoji = {"high": "[HIGH]", "medium": "[MED]", "low": "[LOW]"}.get(sev, "[MED]")
+                    lines.append("  " + emoji + " " + issue.get("issue", str(issue)))
+                file_reviews.append("\n".join(lines))
 
         summary = await generate_summary(pr_info, files)
 
         if file_reviews:
-            issues_section = "
-
-### Inline Issues Found
-
-" + "
-
-".join(file_reviews)
+            issues_section = "\n\n### Inline Issues Found\n\n" + "\n\n".join(file_reviews)
         else:
-            issues_section = "
-
-### Inline Issues
-
-✅ No major issues found."
+            issues_section = "\n\n### Inline Issues\n\n✅ No major issues found."
 
         comment = (
-            "## 🤖 AI Code Review
-
-"
-            f"*Powered by **Groq** ({GROQ_MODEL}) — Free AI PR Reviewer*
-
-"
-            "---
-
-"
-            f"{summary}"
-            f"{issues_section}
-
-"
-            "---
-"
-            f"*Reviewed **{len(files)}** file(s) · Found **{len(all_issues)}** issue(s)*"
+            "## 🤖 AI Code Review\n\n"
+            "*Powered by **Groq** (" + GROQ_MODEL + ") — Free AI PR Reviewer*\n\n"
+            "---\n\n"
+            + summary
+            + issues_section + "\n\n"
+            "---\n"
+            "*Reviewed **" + str(len(files)) + "** file(s) · Found **" + str(len(all_issues)) + "** issue(s)*"
         )
 
         await post_pr_comment(repo, pr_number, comment)
-        print(f"  Review posted for PR #{pr_number}")
+        print("  Review posted for PR #" + str(pr_number))
 
     except Exception as e:
-        print(f"  Error reviewing PR #{pr_number}: {e}")
+        print("  Error reviewing PR #" + str(pr_number) + ": " + str(e))
         try:
             await post_pr_comment(
                 repo, pr_number,
-                f"## 🤖 AI Code Review
-
-❌ Review failed: {e}"
+                "## 🤖 AI Code Review\n\n❌ Review failed: " + str(e)
             )
         except Exception:
             pass
@@ -252,7 +213,7 @@ def health():
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
-    return """<!DOCTYPE html>
+    html = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -278,23 +239,23 @@ h1{font-size:2.5rem;font-weight:700;margin-bottom:12px}
 </head>
 <body>
 <div class="container">
-  <div class="badge">✅ Live</div>
-  <h1>🤖 AI Code Review Bot</h1>
-  <p class="subtitle">Auto-reviews GitHub PRs using Groq AI — 100% free, unlimited</p>
+  <div class="badge">Live</div>
+  <h1>AI Code Review Bot</h1>
+  <p class="subtitle">Auto-reviews GitHub PRs using Groq AI - 100% free, unlimited</p>
   <div class="card">
-    <h2>⚡ Status</h2>
+    <h2>Status</h2>
     <div class="status"><div class="dot"></div><span>Webhook server running and ready</span></div>
   </div>
   <div class="card">
-    <h2>🔧 Connect your GitHub repo</h2>
-    <div class="step"><div class="num">1</div><div class="txt">Go to your repo → <strong>Settings</strong> → <strong>Webhooks</strong> → <strong>Add webhook</strong></div></div>
+    <h2>Connect your GitHub repo</h2>
+    <div class="step"><div class="num">1</div><div class="txt">Go to your repo - Settings - Webhooks - Add webhook</div></div>
     <div class="step"><div class="num">2</div><div class="txt">Payload URL: <code>RENDER_URL/webhook</code></div></div>
     <div class="step"><div class="num">3</div><div class="txt">Content type: <code>application/json</code></div></div>
-    <div class="step"><div class="num">4</div><div class="txt">Events: select <strong>Pull requests</strong> only</div></div>
-    <div class="step"><div class="num">5</div><div class="txt">Save — open a PR and watch the bot review it!</div></div>
+    <div class="step"><div class="num">4</div><div class="txt">Events: select Pull requests only</div></div>
+    <div class="step"><div class="num">5</div><div class="txt">Save - open a PR and watch the bot review it!</div></div>
   </div>
   <div class="card">
-    <h2>🛠 Stack</h2>
+    <h2>Stack</h2>
     <div class="stack">
       <span class="tag">FastAPI</span><span class="tag">Python 3.11</span>
       <span class="tag">Groq llama-3.3-70b</span><span class="tag">GitHub Webhooks</span>
@@ -304,6 +265,7 @@ h1{font-size:2.5rem;font-weight:700;margin-bottom:12px}
 </div>
 </body>
 </html>"""
+    return html
 
 
 @app.post("/webhook")
