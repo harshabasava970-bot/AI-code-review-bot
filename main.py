@@ -1,6 +1,7 @@
 """
 main.py - FastAPI webhook server for AI PR Code Reviewer
 Receives GitHub webhook events and auto-reviews PRs using Groq (free)
+Keep-alive: pings itself every 14 minutes so Render free tier never sleeps.
 """
 import os
 import json
@@ -23,7 +24,33 @@ WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET", "")
 GROQ_MODEL      = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 MAX_FILES       = int(os.environ.get("MAX_FILES", "10"))
 MAX_PATCH_CHARS = int(os.environ.get("MAX_PATCH_CHARS", "3000"))
+RENDER_URL      = os.environ.get("RENDER_URL", "")
 
+
+# ---------------------------------------------------------------------------
+# Keep-alive: ping self every 14 min so Render free tier never sleeps
+# ---------------------------------------------------------------------------
+async def _keep_alive():
+    await asyncio.sleep(60)
+    while True:
+        if RENDER_URL:
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    await client.get(f"{RENDER_URL}/ping")
+                    print("Keep-alive ping sent ✓")
+            except Exception as e:
+                print(f"Keep-alive ping failed: {e}")
+        await asyncio.sleep(14 * 60)
+
+
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(_keep_alive())
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def verify_signature(payload: bytes, signature: str) -> bool:
     if not WEBHOOK_SECRET:
@@ -171,7 +198,7 @@ async def process_pr(repo: str, pr_number: int, pr_title: str):
                 lines = ["**`" + fname + "`**"]
                 for issue in issues:
                     sev   = issue.get("severity", "medium")
-                    emoji = {"high": "[HIGH]", "medium": "[MED]", "low": "[LOW]"}.get(sev, "[MED]")
+                    emoji = {"high": "🔴", "medium": "🟡", "low": "🔵"}.get(sev, "🟡")
                     lines.append("  " + emoji + " " + issue.get("issue", str(issue)))
                 file_reviews.append("\n".join(lines))
 
@@ -206,6 +233,16 @@ async def process_pr(repo: str, pr_number: int, pr_title: str):
             pass
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/ping")
+def ping():
+    """Keep-alive endpoint — called every 14 min to prevent Render sleep."""
+    return {"status": "alive"}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "model": GROQ_MODEL}
@@ -232,35 +269,26 @@ h1{font-size:2.5rem;font-weight:700;margin-bottom:12px}
 .txt{color:#8b949e;font-size:14px;line-height:1.6}
 .txt code{background:#21262d;padding:2px 8px;border-radius:4px;font-family:monospace;color:#e6edf3;font-size:13px}
 .status{display:flex;align-items:center;gap:8px}
-.dot{width:10px;height:10px;border-radius:50%;background:#238636;box-shadow:0 0 8px #238636}
-.stack{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
-.tag{background:#21262d;border:1px solid #30363d;padding:4px 12px;border-radius:20px;font-size:12px;color:#8b949e}
+.dot{width:10px;height:10px;border-radius:50%;background:#238636;box-shadow:0 0 8px #238636;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{box-shadow:0 0 8px #238636}50%{box-shadow:0 0 16px #238636}}
 </style>
 </head>
 <body>
 <div class="container">
-  <div class="badge">Live</div>
-  <h1>AI Code Review Bot</h1>
-  <p class="subtitle">Auto-reviews GitHub PRs using Groq AI - 100% free, unlimited</p>
+  <div class="badge">🟢 Live</div>
+  <h1>🤖 AI Code Review Bot</h1>
+  <p class="subtitle">Auto-reviews GitHub PRs using Groq AI — 100% free, works on any repo</p>
   <div class="card">
-    <h2>Status</h2>
-    <div class="status"><div class="dot"></div><span>Webhook server running and ready</span></div>
+    <h2>⚡ Status</h2>
+    <div class="status"><div class="dot"></div><span>Webhook server running — never sleeps</span></div>
   </div>
   <div class="card">
-    <h2>Connect your GitHub repo</h2>
-    <div class="step"><div class="num">1</div><div class="txt">Go to your repo - Settings - Webhooks - Add webhook</div></div>
-    <div class="step"><div class="num">2</div><div class="txt">Payload URL: <code>RENDER_URL/webhook</code></div></div>
+    <h2>🔗 Add to any GitHub repo (30 seconds)</h2>
+    <div class="step"><div class="num">1</div><div class="txt">Go to your repo → Settings → Webhooks → Add webhook</div></div>
+    <div class="step"><div class="num">2</div><div class="txt">Payload URL: <code>YOUR_RENDER_URL/webhook</code></div></div>
     <div class="step"><div class="num">3</div><div class="txt">Content type: <code>application/json</code></div></div>
-    <div class="step"><div class="num">4</div><div class="txt">Events: select Pull requests only</div></div>
-    <div class="step"><div class="num">5</div><div class="txt">Save - open a PR and watch the bot review it!</div></div>
-  </div>
-  <div class="card">
-    <h2>Stack</h2>
-    <div class="stack">
-      <span class="tag">FastAPI</span><span class="tag">Python 3.11</span>
-      <span class="tag">Groq llama-3.3-70b</span><span class="tag">GitHub Webhooks</span>
-      <span class="tag">Render.com (free)</span>
-    </div>
+    <div class="step"><div class="num">4</div><div class="txt">Events: select <code>Pull requests</code> only</div></div>
+    <div class="step"><div class="num">5</div><div class="txt">Save — open any PR and the bot reviews it automatically!</div></div>
   </div>
 </div>
 </body>
